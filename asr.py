@@ -193,6 +193,12 @@ def build_utterances(
     punctuations: str = "。！？?!",
     max_utterance_seconds: float = 9.0,
     max_utterance_chars: int = 48,
+    min_utterance_chars: int = 4,
+    merge_short_utterances: bool = True,
+    merge_max_gap_seconds: float = 0.25,
+    synthetic_word_times_on_bad_alignment: bool = True,
+    bad_alignment_token_max_seconds: float = 2.0,
+    bad_alignment_short_token_chars: int = 8,
 ) -> List[Dict[str, Any]]:
     """
     Convert WhisperX aligned segments into speaker-aware utterances.
@@ -221,6 +227,103 @@ def build_utterances(
             }
             utterances.append(utt)
             continue
+
+        seg_start = float(seg.get("start")) if seg.get("start") is not None else None
+        seg_end = float(seg.get("end")) if seg.get("end") is not None else None
+        word_dicts: List[Dict[str, Any]] = [w for w in words if isinstance(w, dict)]
+
+        def _normalize_word_times(
+            words_in: List[Dict[str, Any]],
+            s0: Optional[float],
+            e0: Optional[float],
+            default_word_dur: float = 0.12,
+        ) -> None:
+            """
+            Fill/repair per-token timestamps to avoid pathological splits.
+            Mutates `words_in` in-place.
+            """
+            starts: List[Optional[float]] = []
+            ends: List[Optional[float]] = []
+            for w in words_in:
+                ws = w.get("start")
+                we = w.get("end")
+                starts.append(float(ws) if ws is not None else None)
+                ends.append(float(we) if we is not None else None)
+
+            # Backward pass: fill missing ends from next known start.
+            next_start: Optional[float] = None
+            for i in range(len(words_in) - 1, -1, -1):
+                if starts[i] is not None:
+                    next_start = starts[i]
+                if ends[i] is None and next_start is not None:
+                    ends[i] = next_start
+
+            # Forward pass: fill missing starts from previous known end.
+            prev_end: Optional[float] = None
+            for i in range(len(words_in)):
+                if ends[i] is not None:
+                    prev_end = ends[i]
+                if starts[i] is None and prev_end is not None:
+                    starts[i] = prev_end
+
+            for i, w in enumerate(words_in):
+                ws = starts[i]
+                we = ends[i]
+
+                if ws is None and we is not None:
+                    ws = we - float(default_word_dur)
+                if we is None and ws is not None:
+                    we = ws + float(default_word_dur)
+
+                if ws is None:
+                    ws = s0
+                if we is None:
+                    we = e0
+
+                if ws is not None and we is not None and ws > we:
+                    ws = we
+
+                if s0 is not None and ws is not None:
+                    ws = max(s0, ws)
+                if e0 is not None and we is not None:
+                    we = min(e0, we)
+                if ws is not None and we is not None and ws > we:
+                    ws = we
+
+                if ws is not None:
+                    w["start"] = float(ws)
+                if we is not None:
+                    w["end"] = float(we)
+
+        if word_dicts:
+            _normalize_word_times(word_dicts, seg_start, seg_end)
+
+        def _looks_like_bad_alignment(words_in: List[Dict[str, Any]]) -> bool:
+            if not (synthetic_word_times_on_bad_alignment and seg_start is not None and seg_end is not None):
+                return False
+            for w in words_in:
+                ws = w.get("start")
+                we = w.get("end")
+                if ws is None or we is None:
+                    continue
+                try:
+                    dur = float(we) - float(ws)
+                except Exception:
+                    continue
+                token = (w.get("word") or "").strip()
+                if token and len(token) <= int(bad_alignment_short_token_chars) and dur >= float(bad_alignment_token_max_seconds):
+                    return True
+            return False
+
+        if word_dicts and _looks_like_bad_alignment(word_dicts):
+            # Fallback: ignore alignment word times and assign synthetic times linearly within the segment.
+            # This avoids absurd boundaries like a short token spanning tens of seconds.
+            total = len(word_dicts)
+            dur = float(seg_end - seg_start) if (seg_end is not None and seg_start is not None) else 0.0
+            if total > 0 and dur > 0 and seg_start is not None:
+                for i, w in enumerate(word_dicts):
+                    w["start"] = float(seg_start + dur * (i / total))
+                    w["end"] = float(seg_start + dur * ((i + 1) / total))
 
         cur_speaker = None
         cur_words: List[Dict[str, Any]] = []
@@ -278,26 +381,25 @@ def build_utterances(
         def should_split_after() -> bool:
             if not resegment or not cur_words:
                 return False
+            cur_len = len("".join(cur_text_parts).strip())
             # duration cap
             s = cur_start()
             e = cur_end()
             if s is not None and e is not None and max_utterance_seconds is not None and max_utterance_seconds > 0:
-                if (e - s) >= float(max_utterance_seconds):
+                if cur_len >= int(min_utterance_chars) and (e - s) >= float(max_utterance_seconds):
                     return True
             # length cap
             if max_utterance_chars is not None and max_utterance_chars > 0:
-                if len("".join(cur_text_parts)) >= int(max_utterance_chars):
+                if cur_len >= int(min_utterance_chars) and cur_len >= int(max_utterance_chars):
                     return True
             # punctuation boundary
             if split_on_punct and punctuations:
                 tail = ("".join(cur_text_parts)).rstrip()
-                if tail and tail[-1] in punctuations:
+                if cur_len >= int(min_utterance_chars) and tail and tail[-1] in punctuations:
                     return True
             return False
 
-        for w in words:
-            if not isinstance(w, dict):
-                continue
+        for w in word_dicts:
             spk = w.get("speaker") or seg.get("speaker")
             if cur_speaker is None:
                 cur_speaker = spk
@@ -321,6 +423,45 @@ def build_utterances(
                 prev_word_end = None
 
         flush()
+
+    if merge_short_utterances and utterances:
+        merged: List[Dict[str, Any]] = []
+
+        def _len_text(u: Dict[str, Any]) -> int:
+            return len((u.get("text") or "").strip())
+
+        def _gap(prev: Dict[str, Any], cur: Dict[str, Any]) -> Optional[float]:
+            pe = prev.get("end")
+            cs = cur.get("start")
+            if pe is None or cs is None:
+                return None
+            try:
+                return float(cs) - float(pe)
+            except Exception:
+                return None
+
+        for u in utterances:
+            if not merged:
+                merged.append(u)
+                continue
+
+            prev = merged[-1]
+            same_speaker = (prev.get("speaker") == u.get("speaker"))
+            g = _gap(prev, u)
+            prev_short = _len_text(prev) > 0 and _len_text(prev) < int(min_utterance_chars)
+            cur_short = _len_text(u) > 0 and _len_text(u) < int(min_utterance_chars)
+
+            # Merge small fragments back to neighbors to avoid splitting inside a word
+            if same_speaker and (prev_short or cur_short) and (g is None or g <= float(merge_max_gap_seconds)):
+                prev["text"] = ((prev.get("text") or "") + (u.get("text") or "")).strip()
+                if prev.get("start") is None:
+                    prev["start"] = u.get("start")
+                prev["end"] = u.get("end") if u.get("end") is not None else prev.get("end")
+                if include_words and "words" in prev and "words" in u and isinstance(prev["words"], list) and isinstance(u["words"], list):
+                    prev["words"].extend(u["words"])
+            else:
+                merged.append(u)
+        utterances = merged
 
     return utterances
 
@@ -363,6 +504,9 @@ if __name__ == "__main__":
     parser.add_argument("--punctuations", default="。！？?!", help="Punctuations used for splitting")
     parser.add_argument("--max-utterance-seconds", type=float, default=9.0, help="Max utterance duration before forced split")
     parser.add_argument("--max-utterance-chars", type=int, default=48, help="Max utterance char length before forced split")
+    parser.add_argument("--min-utterance-chars", type=int, default=4, help="Don't finalize splits for utterances shorter than this")
+    parser.add_argument("--merge-short-utterances", action=argparse.BooleanOptionalAction, default=True, help="Merge very short utterances back to neighbors (default: enabled)")
+    parser.add_argument("--merge-max-gap-seconds", type=float, default=0.25, help="Max gap allowed when merging short utterances")
 
     parser.add_argument("--keep-words", action="store_true", help="Keep words array in output (huge for ja/zh)")
     args = parser.parse_args()
@@ -405,6 +549,9 @@ if __name__ == "__main__":
         punctuations=args.punctuations,
         max_utterance_seconds=args.max_utterance_seconds,
         max_utterance_chars=args.max_utterance_chars,
+        min_utterance_chars=args.min_utterance_chars,
+        merge_short_utterances=args.merge_short_utterances,
+        merge_max_gap_seconds=args.merge_max_gap_seconds,
     )
 
     output: Dict[str, Any] = {
