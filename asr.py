@@ -5,6 +5,7 @@ import torch
 import os
 import sys
 import argparse
+import inspect
 from typing import Any, Dict, List, Optional
 
 # Optional: load HF_TOKEN from .env (like JS dotenv)
@@ -37,7 +38,17 @@ if sys.platform == "win32":
             print(f"Adding DLL directory: {path}")
             os.add_dll_directory(path)
 
-def transcribe_video(video_path, language="ja"):
+def transcribe_video(
+    video_path: str,
+    language: str = "ja",
+    *,
+    vad_filter: bool = True,
+    vad_threshold: float = 0.5,
+    vad_min_silence_ms: int = 200,
+    vad_speech_pad_ms: int = 200,
+    condition_on_previous_text: bool = True,
+    chunk_length: Optional[int] = None,
+):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     batch_size = 4 # reduce if low on GPU mem
     compute_type = "float16" if device == "cuda" else "int8" # change to "int8" if low on GPU mem (may reduce accuracy)
@@ -50,7 +61,52 @@ def transcribe_video(video_path, language="ja"):
     audio = whisperx.load_audio(video_path)
     
     print("Transcribing...")
-    result = model.transcribe(audio, batch_size=batch_size, language=language)
+    vad_parameters = None
+    if vad_filter:
+        # faster-whisper VAD options (dict is accepted)
+        vad_parameters = {
+            "threshold": float(vad_threshold),
+            "min_silence_duration_ms": int(vad_min_silence_ms),
+            "speech_pad_ms": int(vad_speech_pad_ms),
+        }
+
+    # WhisperX returns different pipeline classes across versions; their transcribe()
+    # signatures are not stable. Filter kwargs by supported parameter names to stay compatible.
+    transcribe_kwargs: Dict[str, Any] = {
+        "batch_size": batch_size,
+        "language": language,
+        "condition_on_previous_text": condition_on_previous_text,
+        "chunk_length": chunk_length,
+        "vad_filter": vad_filter,
+        "vad_parameters": vad_parameters,
+    }
+    try:
+        sig = inspect.signature(model.transcribe)
+        supported = set(sig.parameters.keys())
+        filtered_kwargs = {k: v for k, v in transcribe_kwargs.items() if k in supported and v is not None}
+
+        if vad_filter and ("vad_filter" not in supported and "vad_parameters" not in supported):
+            print("提示：当前 WhisperX pipeline 的 transcribe() 不支持 VAD 参数（vad_filter/vad_parameters），将跳过 VAD。")
+        result = model.transcribe(audio, **filtered_kwargs)
+    except TypeError as e:
+        # Fallback: try without any optional kwargs
+        msg = str(e)
+        if "vad_filter" in msg or "vad_parameters" in msg:
+            print("提示：当前 WhisperX pipeline 不支持 VAD 参数，已自动回退为不使用 VAD 的转写。")
+            try:
+                # remove vad keys and retry with remaining supported ones
+                sig = inspect.signature(model.transcribe)
+                supported = set(sig.parameters.keys())
+                filtered_kwargs = {
+                    k: v
+                    for k, v in transcribe_kwargs.items()
+                    if k in supported and v is not None and k not in {"vad_filter", "vad_parameters"}
+                }
+                result = model.transcribe(audio, **filtered_kwargs)
+            except Exception:
+                result = model.transcribe(audio)
+        else:
+            raise
     
     # 2. Align whisper output (adds word-level timestamps; may be huge for JA/ZH)
     print(f"Loading alignment model for {language}...")
@@ -129,60 +185,143 @@ def diarize_and_assign_speakers(
 def build_utterances(
     aligned_result: Dict[str, Any],
     include_words: bool = False,
+    *,
+    resegment: bool = True,
+    split_on_speaker_change: bool = True,
+    split_on_gap_seconds: float = 0.6,
+    split_on_punct: bool = True,
+    punctuations: str = "。！？?!",
+    max_utterance_seconds: float = 9.0,
+    max_utterance_chars: int = 48,
 ) -> List[Dict[str, Any]]:
     """
     Convert WhisperX aligned segments into speaker-aware utterances.
 
     - If `words[].speaker` exists, splits on speaker changes inside a segment.
     - Otherwise falls back to segment-level utterances.
+
+    If `resegment=True`, applies additional splitting rules to avoid overly long utterances:
+    - split on long pauses (word gap)
+    - split on punctuation boundaries
+    - split when exceeding max duration or max char length
     """
     utterances: List[Dict[str, Any]] = []
-    for seg in aligned_result.get("segments", []) or []:
+    segments = aligned_result.get("segments", []) or []
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+
         words = seg.get("words")
-        if isinstance(words, list) and words and any(isinstance(w, dict) and "speaker" in w for w in words):
-            cur_speaker = None
-            cur_words: List[Dict[str, Any]] = []
-
-            def flush():
-                nonlocal cur_speaker, cur_words
-                if not cur_words:
-                    return
-                text = "".join((w.get("word") or "") for w in cur_words).strip()
-                start = next((w.get("start") for w in cur_words if w.get("start") is not None), seg.get("start"))
-                end = next((w.get("end") for w in reversed(cur_words) if w.get("end") is not None), seg.get("end"))
-                utt: Dict[str, Any] = {
-                    "start": float(start) if start is not None else None,
-                    "end": float(end) if end is not None else None,
-                    "speaker": cur_speaker or seg.get("speaker"),
-                    "text": text,
-                }
-                if include_words:
-                    utt["words"] = cur_words
-                utterances.append(utt)
-                cur_words = []
-
-            for w in words:
-                if not isinstance(w, dict):
-                    continue
-                spk = w.get("speaker") or seg.get("speaker")
-                if cur_speaker is None:
-                    cur_speaker = spk
-                if spk != cur_speaker and cur_words:
-                    flush()
-                    cur_speaker = spk
-                # Avoid copying per-word dicts (JA/ZH char-level can be huge).
-                cur_words.append(w)
-            flush()
-        else:
+        if not (isinstance(words, list) and words):
             utt = {
                 "start": float(seg.get("start")) if seg.get("start") is not None else None,
                 "end": float(seg.get("end")) if seg.get("end") is not None else None,
                 "speaker": seg.get("speaker"),
                 "text": (seg.get("text") or "").strip(),
             }
-            if include_words and isinstance(words, list):
-                utt["words"] = words
             utterances.append(utt)
+            continue
+
+        cur_speaker = None
+        cur_words: List[Dict[str, Any]] = []
+        cur_text_parts: List[str] = []
+        prev_word_end: Optional[float] = None
+
+        def cur_start() -> Optional[float]:
+            for w in cur_words:
+                s = w.get("start")
+                if s is not None:
+                    return float(s)
+            s0 = seg.get("start")
+            return float(s0) if s0 is not None else None
+
+        def cur_end() -> Optional[float]:
+            for w in reversed(cur_words):
+                e = w.get("end")
+                if e is not None:
+                    return float(e)
+            e0 = seg.get("end")
+            return float(e0) if e0 is not None else None
+
+        def flush():
+            nonlocal cur_words, cur_text_parts
+            if not cur_words:
+                return
+            text = "".join(cur_text_parts).strip()
+            utt: Dict[str, Any] = {
+                "start": cur_start(),
+                "end": cur_end(),
+                "speaker": cur_speaker or seg.get("speaker"),
+                "text": text,
+            }
+            if include_words:
+                utt["words"] = cur_words
+            utterances.append(utt)
+            cur_words = []
+            cur_text_parts = []
+
+        def should_split_before(next_word: Dict[str, Any], next_speaker: Any) -> bool:
+            if not resegment:
+                return False
+            # 1) speaker turn
+            if split_on_speaker_change and cur_speaker is not None and next_speaker != cur_speaker and cur_words:
+                return True
+            # 2) long pause
+            if split_on_gap_seconds is not None and split_on_gap_seconds > 0 and prev_word_end is not None:
+                ns = next_word.get("start")
+                if ns is not None:
+                    gap = float(ns) - float(prev_word_end)
+                    if gap >= float(split_on_gap_seconds) and cur_words:
+                        return True
+            return False
+
+        def should_split_after() -> bool:
+            if not resegment or not cur_words:
+                return False
+            # duration cap
+            s = cur_start()
+            e = cur_end()
+            if s is not None and e is not None and max_utterance_seconds is not None and max_utterance_seconds > 0:
+                if (e - s) >= float(max_utterance_seconds):
+                    return True
+            # length cap
+            if max_utterance_chars is not None and max_utterance_chars > 0:
+                if len("".join(cur_text_parts)) >= int(max_utterance_chars):
+                    return True
+            # punctuation boundary
+            if split_on_punct and punctuations:
+                tail = ("".join(cur_text_parts)).rstrip()
+                if tail and tail[-1] in punctuations:
+                    return True
+            return False
+
+        for w in words:
+            if not isinstance(w, dict):
+                continue
+            spk = w.get("speaker") or seg.get("speaker")
+            if cur_speaker is None:
+                cur_speaker = spk
+
+            if should_split_before(w, spk):
+                flush()
+                cur_speaker = spk
+                prev_word_end = None
+
+            token = (w.get("word") or "")
+            cur_words.append(w)
+            cur_text_parts.append(token)
+
+            we = w.get("end")
+            if we is not None:
+                prev_word_end = float(we)
+
+            if should_split_after():
+                flush()
+                cur_speaker = spk
+                prev_word_end = None
+
+        flush()
+
     return utterances
 
 
@@ -201,11 +340,30 @@ if __name__ == "__main__":
     parser.add_argument("input", nargs="?", default="test.mp4", help="Input video/audio path (default: test.mp4)")
     parser.add_argument("--language", default="ja", help="Language code (default: ja)")
     parser.add_argument("--output", default="asr_result.json", help="Output json path (default: asr_result.json)")
+
+    # Transcription segmentation knobs (VAD + decoding behavior)
+    parser.add_argument("--vad-filter", action=argparse.BooleanOptionalAction, default=True, help="Enable VAD-based audio segmentation (default: enabled)")
+    parser.add_argument("--vad-threshold", type=float, default=0.5, help="VAD threshold (higher=more strict)")
+    parser.add_argument("--vad-min-silence-ms", type=int, default=200, help="VAD min silence duration to split (ms)")
+    parser.add_argument("--vad-speech-pad-ms", type=int, default=200, help="VAD speech padding (ms)")
+    parser.add_argument("--condition-on-previous-text", action=argparse.BooleanOptionalAction, default=True, help="Decode conditioning on previous text (default: enabled)")
+    parser.add_argument("--chunk-length", type=int, default=None, help="Max chunk length in seconds (optional)")
+
     parser.add_argument("--diarize", action="store_true", help="Enable speaker diarization (requires HF token)")
     parser.add_argument("--hf-token", default=os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN"), help="Hugging Face token (or env HF_TOKEN)")
     parser.add_argument("--diarize-model", default=None, help="pyannote diarization model id (optional)")
     parser.add_argument("--min-speakers", type=int, default=None, help="Min speakers (optional)")
     parser.add_argument("--max-speakers", type=int, default=None, help="Max speakers (optional)")
+
+    # Post re-segmentation (utterances) knobs
+    parser.add_argument("--resegment", action=argparse.BooleanOptionalAction, default=True, help="Re-segment utterances by pauses/punct/length (default: enabled)")
+    parser.add_argument("--split-on-speaker-change", action=argparse.BooleanOptionalAction, default=True, help="Split utterances on speaker change (default: enabled)")
+    parser.add_argument("--split-on-gap-seconds", type=float, default=0.6, help="Split utterances if word gap >= this seconds")
+    parser.add_argument("--split-on-punct", action=argparse.BooleanOptionalAction, default=True, help="Split utterances on punctuation boundary (default: enabled)")
+    parser.add_argument("--punctuations", default="。！？?!", help="Punctuations used for splitting")
+    parser.add_argument("--max-utterance-seconds", type=float, default=9.0, help="Max utterance duration before forced split")
+    parser.add_argument("--max-utterance-chars", type=int, default=48, help="Max utterance char length before forced split")
+
     parser.add_argument("--keep-words", action="store_true", help="Keep words array in output (huge for ja/zh)")
     args = parser.parse_args()
 
@@ -215,7 +373,16 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    results = transcribe_video(input_video, language=args.language)
+    results = transcribe_video(
+        input_video,
+        language=args.language,
+        vad_filter=args.vad_filter,
+        vad_threshold=args.vad_threshold,
+        vad_min_silence_ms=args.vad_min_silence_ms,
+        vad_speech_pad_ms=args.vad_speech_pad_ms,
+        condition_on_previous_text=args.condition_on_previous_text,
+        chunk_length=args.chunk_length,
+    )
 
     if args.diarize:
         results = diarize_and_assign_speakers(
@@ -228,7 +395,17 @@ if __name__ == "__main__":
             max_speakers=args.max_speakers,
         )
 
-    utterances = build_utterances(results, include_words=args.keep_words)
+    utterances = build_utterances(
+        results,
+        include_words=args.keep_words,
+        resegment=args.resegment,
+        split_on_speaker_change=args.split_on_speaker_change,
+        split_on_gap_seconds=args.split_on_gap_seconds,
+        split_on_punct=args.split_on_punct,
+        punctuations=args.punctuations,
+        max_utterance_seconds=args.max_utterance_seconds,
+        max_utterance_chars=args.max_utterance_chars,
+    )
 
     output: Dict[str, Any] = {
         "language": args.language,
